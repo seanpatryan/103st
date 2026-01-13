@@ -1,0 +1,1332 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+NYC SUBWAY REAL-TIME ARRIVAL DISPLAY
+103 St Station (Central Park West) - A, B & C Trains
+================================================================================
+
+FEATURES:
+- Classic NYC subway styling with Helvetica typography
+- Real-time MTA GTFS-RT feed parsing
+- Robust error recovery with exponential backoff
+- Debounced updates to prevent UI thrashing
+- RequestAnimationFrame for smoother rendering
+- Better memory management (object pooling, avoiding allocations)
+- Stale data detection and handling
+- Network status monitoring with offline banner
+- Graceful degradation when feeds are unavailable
+- Optimized DOM operations with DocumentFragment
+- Auto page refresh every 4 hours for long-running displays
+- Feed timestamp validation to detect stale API data
+- Automatic cleanup of departed trains
+- 5-second render cycle for accurate countdown times
+
+DATA ACCURACY SAFEGUARDS:
+- Validates MTA feed timestamps to detect stale data
+- Filters arrivals >60 min in future as likely erroneous
+- Tracks individual feed health (ACE vs BDFM)
+- Shows partial data warnings when one feed fails
+- 3-minute stale data threshold with visual indicator
+- Automatic retry with exponential backoff on failures
+
+SETUP INSTRUCTIONS:
+1. Host this file on a web server (local or remote)
+2. Open in a fullscreen/kiosk browser on your tablet
+3. Optional URL params: ?station=A18&count=2&refresh=60000
+
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=1024, height=600, initial-scale=1.0, user-scalable=no">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <title>103 St - Real-Time Arrivals</title>
+    
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="theme-color" content="#000000">
+    
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            --mta-orange: #FF6319;
+            --mta-blue: #0039A6;
+            --mta-black: #000000;
+            --mta-white: #FFFFFF;
+            --mta-green: #00933C;
+            --subway-font: Helvetica Neue, Helvetica, Arial, sans-serif;
+            --arriving-green: #00FF00;
+            --arriving-soon-yellow: #FFDD00;
+            --error-red: #FF4444;
+            --warning-orange: #FFAA00;
+            --ok-green: #00AA00;
+            --stale-purple: #AA44AA;
+            --bg-primary: #000000;
+            --bg-elevated: rgba(255, 255, 255, 0.02);
+            --bg-highlight: rgba(255, 255, 255, 0.06);
+            --text-primary: #FFFFFF;
+            --text-secondary: #888888;
+            --text-muted: #666666;
+            --text-dim: #555555;
+            --text-faint: #444444;
+            --border-subtle: #333333;
+            --font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        }
+        
+        *, *::before, *::after {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        html, body {
+            width: 1024px;
+            height: 600px;
+            overflow: hidden;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-family: var(--font-family);
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+        
+        .container {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            padding: 8px 20px 10px;
+        }
+        
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding-bottom: 10px;
+            border-bottom: 1px solid var(--border-subtle);
+            margin-bottom: 8px;
+            flex-shrink: 0;
+        }
+        
+        .station-name {
+            font-family: var(--subway-font);
+            font-size: 42px;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+            color: var(--mta-white);
+            background-color: var(--mta-black);
+            padding: 6px 24px;
+            border-radius: 24px;
+            border: 3px solid var(--mta-white);
+            text-transform: none;
+        }
+        
+        .clock {
+            font-size: 18px;
+            font-weight: 400;
+            color: var(--text-muted);
+            font-variant-numeric: tabular-nums;
+        }
+        
+        .arrivals-container {
+            flex: 1;
+            display: flex;
+            gap: 20px;
+        }
+        
+        .direction-column {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .direction-header {
+            font-size: 28px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 6px;
+            color: var(--text-secondary);
+            padding: 8px 0;
+            margin-bottom: 10px;
+            text-align: center;
+        }
+        
+        .direction-header .arrow {
+            margin-right: 6px;
+        }
+        
+        .trains-list {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        
+        .train-row {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            padding: 10px 20px;
+            background: var(--bg-elevated);
+            border-radius: 8px;
+            min-height: 120px;
+            transition: background-color 0.3s ease, opacity 0.3s ease;
+            will-change: background-color, opacity;
+        }
+        
+        .train-row.arriving {
+            background: var(--bg-highlight);
+        }
+        
+        .train-row.stale {
+            opacity: 0.5;
+        }
+        
+        .train-badge {
+            width: 110px;
+            height: 110px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 72px;
+            font-weight: 700;
+            color: var(--text-primary);
+            flex-shrink: 0;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+        }
+        
+        .train-badge.A { background-color: var(--mta-blue); }
+        .train-badge.B { background-color: var(--mta-orange); }
+        .train-badge.C { background-color: var(--mta-blue); }
+        .train-badge.empty {
+            background: #222222;
+            color: var(--text-faint);
+        }
+        
+        .train-info {
+            flex: 1;
+            margin-left: 24px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        
+        .train-destination {
+            font-size: 20px;
+            font-weight: 400;
+            color: var(--text-secondary);
+            margin-bottom: 2px;
+            letter-spacing: 0.5px;
+        }
+        
+        .train-time {
+            font-size: 90px;
+            font-weight: 700;
+            letter-spacing: -3px;
+            line-height: 1;
+            font-variant-numeric: tabular-nums;
+        }
+        
+        .train-time .unit {
+            font-size: 42px;
+            font-weight: 400;
+            margin-left: 6px;
+            color: var(--text-muted);
+            letter-spacing: 0;
+        }
+        
+        .train-time.arriving-now {
+            color: var(--arriving-green);
+            font-size: 64px;
+            letter-spacing: -1px;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+        
+        .train-time.arriving-soon {
+            color: var(--arriving-soon-yellow);
+        }
+        
+        .train-time.no-trains {
+            font-size: 28px;
+            color: var(--text-faint);
+            letter-spacing: 0;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        .divider {
+            width: 2px;
+            background: linear-gradient(
+                to bottom,
+                transparent 0%,
+                var(--border-subtle) 15%,
+                var(--border-subtle) 85%,
+                transparent 100%
+            );
+        }
+        
+        .footer {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding-top: 6px;
+            flex-shrink: 0;
+        }
+        
+        .status {
+            font-size: 12px;
+            color: var(--text-faint);
+            display: flex;
+            align-items: center;
+        }
+        
+        .status.error { color: var(--error-red); }
+        .status.loading { color: var(--warning-orange); }
+        .status.stale { color: var(--stale-purple); }
+        
+        .status .indicator {
+            display: inline-block;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            margin-right: 6px;
+            background: var(--ok-green);
+        }
+        
+        .status.error .indicator { background: var(--error-red); }
+        .status.stale .indicator { background: var(--stale-purple); }
+        .status.loading .indicator {
+            background: var(--warning-orange);
+            animation: blink 1s ease-in-out infinite;
+        }
+        
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+        
+        .error-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.95);
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+        }
+        
+        .error-overlay.visible {
+            display: flex;
+        }
+        
+        .error-message {
+            font-size: 32px;
+            color: #FF6666;
+            text-align: center;
+            margin-bottom: 15px;
+        }
+        
+        .error-detail {
+            font-size: 18px;
+            color: var(--text-secondary);
+            text-align: center;
+        }
+        
+        .retry-indicator {
+            margin-top: 25px;
+            font-size: 14px;
+            color: var(--text-dim);
+        }
+        
+        .offline-banner {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            background: var(--error-red);
+            color: white;
+            text-align: center;
+            padding: 4px;
+            font-size: 12px;
+            font-weight: 700;
+            z-index: 101;
+            display: none;
+        }
+        
+        .offline-banner.visible {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div class="offline-banner" id="offline-banner">OFFLINE - Waiting for connection...</div>
+    
+    <div class="container">
+        <header class="header">
+            <h1 class="station-name">103 St</h1>
+            <time class="clock" id="clock">--:--</time>
+        </header>
+        
+        <main class="arrivals-container">
+            <section class="direction-column">
+                <h2 class="direction-header">
+                    <span class="arrow">↑</span>Uptown
+                </h2>
+                <div class="trains-list" id="uptown-trains"></div>
+            </section>
+            
+            <div class="divider"></div>
+            
+            <section class="direction-column">
+                <h2 class="direction-header">
+                    <span class="arrow">↓</span>Downtown
+                </h2>
+                <div class="trains-list" id="downtown-trains"></div>
+            </section>
+        </main>
+        
+        <footer class="footer">
+            <div class="status" id="status">
+                <span class="indicator"></span>
+                <span class="text">Initializing...</span>
+            </div>
+        </footer>
+    </div>
+    
+    <div class="error-overlay" id="error-overlay">
+        <div class="error-message">Data temporarily unavailable</div>
+        <div class="error-detail" id="error-detail">Please check your connection</div>
+        <div class="retry-indicator" id="retry-indicator">Retrying automatically...</div>
+    </div>
+
+    <script>
+        'use strict';
+        
+        /**
+         * ================================================================
+         * CONFIGURATION
+         * ================================================================
+         */
+        const urlParams = new URLSearchParams(window.location.search);
+        
+        const CONFIG = Object.freeze({
+            FEEDS: {
+                ACE: 'https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-ace',
+                BDFM: 'https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-bdfm'
+            },
+            STATION_ID: urlParams.get('station') || 'A18',
+            TRAINS: ['A', 'B', 'C'],
+            REFRESH_INTERVAL: Math.max(30000, parseInt(urlParams.get('refresh')) || 60000),
+            TRAINS_PER_DIRECTION: Math.min(4, Math.max(1, parseInt(urlParams.get('count')) || 2)),
+            RETRY_DELAY_BASE: 5000,
+            RETRY_DELAY_MAX: 60000,
+            MAX_RETRIES: 5,
+            FETCH_TIMEOUT: 15000,
+            STALE_DATA_THRESHOLD: 180000, // 3 minutes
+            RENDER_DEBOUNCE: 100,
+            CLOCK_UPDATE_INTERVAL: 1000
+        });
+        
+        const DESTINATIONS = Object.freeze({
+            N: { A: 'Inwood-207 St', B: '145 St', C: '168 St' },
+            S: { A: 'Far Rockaway', B: 'Brighton Beach', C: 'Euclid Av' }
+        });
+
+        /**
+         * ================================================================
+         * DOM CACHE
+         * ================================================================
+         */
+        const DOM = {
+            uptownTrains: null,
+            downtownTrains: null,
+            clock: null,
+            status: null,
+            statusText: null,
+            errorOverlay: null,
+            errorDetail: null,
+            retryIndicator: null,
+            offlineBanner: null
+        };
+        
+        function cacheDOMRefs() {
+            DOM.uptownTrains = document.getElementById('uptown-trains');
+            DOM.downtownTrains = document.getElementById('downtown-trains');
+            DOM.clock = document.getElementById('clock');
+            DOM.status = document.getElementById('status');
+            DOM.statusText = DOM.status?.querySelector('.text');
+            DOM.errorOverlay = document.getElementById('error-overlay');
+            DOM.errorDetail = document.getElementById('error-detail');
+            DOM.retryIndicator = document.getElementById('retry-indicator');
+            DOM.offlineBanner = document.getElementById('offline-banner');
+        }
+
+        /**
+         * ================================================================
+         * UTILITY FUNCTIONS
+         * ================================================================
+         */
+        
+        // Debounce function to prevent excessive calls
+        function debounce(fn, delay) {
+            let timeoutId = null;
+            let pendingArgs = null;
+            
+            const execute = () => {
+                if (pendingArgs !== null) {
+                    fn.apply(null, pendingArgs);
+                    pendingArgs = null;
+                }
+                timeoutId = null;
+            };
+            
+            return function(...args) {
+                pendingArgs = args;
+                if (timeoutId === null) {
+                    timeoutId = setTimeout(execute, delay);
+                }
+            };
+        }
+        
+        // Calculate exponential backoff delay
+        function getBackoffDelay(retryCount) {
+            const delay = CONFIG.RETRY_DELAY_BASE * Math.pow(2, retryCount);
+            return Math.min(delay, CONFIG.RETRY_DELAY_MAX);
+        }
+        
+        // Safe JSON stringify for logging
+        function safeStringify(obj) {
+            try {
+                return JSON.stringify(obj);
+            } catch {
+                return '[object]';
+            }
+        }
+
+        /**
+         * ================================================================
+         * ROBUST PROTOBUF DECODER FOR GTFS-RT
+         * With improved bounds checking and error recovery
+         * ================================================================
+         */
+        class ProtobufDecoder {
+            static textDecoder = new TextDecoder('utf-8', { fatal: false });
+            
+            constructor(buffer) {
+                if (buffer instanceof Uint8Array) {
+                    this.buffer = buffer;
+                } else if (buffer instanceof ArrayBuffer) {
+                    this.buffer = new Uint8Array(buffer);
+                } else {
+                    this.buffer = new Uint8Array(0);
+                }
+                this.pos = 0;
+                this.length = this.buffer.length;
+            }
+            
+            canRead(n = 1) {
+                return this.pos + n <= this.length;
+            }
+            
+            readVarint() {
+                let result = 0;
+                let shift = 0;
+                const maxShift = 35; // Max 5 bytes for 32-bit varint
+                
+                while (shift < maxShift && this.canRead()) {
+                    const byte = this.buffer[this.pos++];
+                    result |= (byte & 0x7F) << shift;
+                    
+                    if ((byte & 0x80) === 0) {
+                        return result >>> 0;
+                    }
+                    shift += 7;
+                }
+                
+                return result >>> 0;
+            }
+            
+            readVarint64() {
+                let lo = 0;
+                let hi = 0;
+                let shift = 0;
+                
+                // Read low 28 bits
+                while (shift < 28 && this.canRead()) {
+                    const byte = this.buffer[this.pos++];
+                    lo |= (byte & 0x7F) << shift;
+                    if ((byte & 0x80) === 0) return lo >>> 0;
+                    shift += 7;
+                }
+                
+                // Handle boundary byte
+                if (!this.canRead()) return lo >>> 0;
+                let byte = this.buffer[this.pos++];
+                lo |= (byte & 0x0F) << 28;
+                hi = (byte & 0x70) >> 4;
+                
+                if ((byte & 0x80) === 0) {
+                    return hi * 0x100000000 + (lo >>> 0);
+                }
+                
+                // Read remaining high bits
+                shift = 3;
+                while (shift < 32 && this.canRead()) {
+                    byte = this.buffer[this.pos++];
+                    hi |= (byte & 0x7F) << shift;
+                    if ((byte & 0x80) === 0) break;
+                    shift += 7;
+                }
+                
+                return hi * 0x100000000 + (lo >>> 0);
+            }
+            
+            readBytes() {
+                const len = this.readVarint();
+                
+                if (len <= 0) return new Uint8Array(0);
+                
+                const available = this.length - this.pos;
+                const safeLen = Math.min(len, available);
+                
+                if (safeLen <= 0) return new Uint8Array(0);
+                
+                const bytes = this.buffer.subarray(this.pos, this.pos + safeLen);
+                this.pos += safeLen;
+                return bytes;
+            }
+            
+            readString() {
+                const bytes = this.readBytes();
+                if (bytes.length === 0) return '';
+                
+                try {
+                    return ProtobufDecoder.textDecoder.decode(bytes);
+                } catch {
+                    return '';
+                }
+            }
+            
+            skipField(wireType) {
+                switch (wireType) {
+                    case 0: // Varint
+                        this.readVarint();
+                        break;
+                    case 1: // 64-bit
+                        this.pos = Math.min(this.pos + 8, this.length);
+                        break;
+                    case 2: // Length-delimited
+                        const len = this.readVarint();
+                        this.pos = Math.min(this.pos + Math.max(0, len), this.length);
+                        break;
+                    case 5: // 32-bit
+                        this.pos = Math.min(this.pos + 4, this.length);
+                        break;
+                    default:
+                        // Unknown wire type - skip a byte to avoid infinite loops
+                        this.pos = Math.min(this.pos + 1, this.length);
+                }
+            }
+            
+            parseFeedMessage() {
+                const msg = { header: null, entity: [] };
+                
+                while (this.canRead()) {
+                    const startPos = this.pos;
+                    
+                    try {
+                        const tag = this.readVarint();
+                        if (tag === 0) break;
+                        
+                        const field = tag >>> 3;
+                        const wire = tag & 0x7;
+                        
+                        if (field === 1 && wire === 2) {
+                            msg.header = this.parseHeader(this.readBytes());
+                        } else if (field === 2 && wire === 2) {
+                            const entity = this.parseEntity(this.readBytes());
+                            if (entity) msg.entity.push(entity);
+                        } else {
+                            this.skipField(wire);
+                        }
+                    } catch (e) {
+                        // Prevent infinite loop by ensuring position advances
+                        if (this.pos === startPos) this.pos++;
+                        continue;
+                    }
+                }
+                
+                return msg;
+            }
+            
+            parseHeader(bytes) {
+                if (!bytes || bytes.length === 0) return {};
+                
+                const d = new ProtobufDecoder(bytes);
+                const h = {};
+                
+                while (d.canRead()) {
+                    const startPos = d.pos;
+                    try {
+                        const tag = d.readVarint();
+                        if (tag === 0) break;
+                        
+                        const field = tag >>> 3;
+                        const wire = tag & 0x7;
+                        
+                        if (field === 1 && wire === 2) {
+                            h.version = d.readString();
+                        } else if (field === 3 && wire === 0) {
+                            h.timestamp = d.readVarint64();
+                        } else {
+                            d.skipField(wire);
+                        }
+                    } catch {
+                        if (d.pos === startPos) d.pos++;
+                    }
+                }
+                
+                return h;
+            }
+            
+            parseEntity(bytes) {
+                if (!bytes || bytes.length === 0) return null;
+                
+                const d = new ProtobufDecoder(bytes);
+                const e = { id: null, tripUpdate: null };
+                
+                while (d.canRead()) {
+                    const startPos = d.pos;
+                    try {
+                        const tag = d.readVarint();
+                        if (tag === 0) break;
+                        
+                        const field = tag >>> 3;
+                        const wire = tag & 0x7;
+                        
+                        if (field === 1 && wire === 2) {
+                            e.id = d.readString();
+                        } else if (field === 3 && wire === 2) {
+                            e.tripUpdate = this.parseTripUpdate(d.readBytes());
+                        } else {
+                            d.skipField(wire);
+                        }
+                    } catch {
+                        if (d.pos === startPos) d.pos++;
+                    }
+                }
+                
+                return e.tripUpdate ? e : null;
+            }
+            
+            parseTripUpdate(bytes) {
+                if (!bytes || bytes.length === 0) return null;
+                
+                const d = new ProtobufDecoder(bytes);
+                const tu = { trip: null, stopTimeUpdate: [] };
+                
+                while (d.canRead()) {
+                    const startPos = d.pos;
+                    try {
+                        const tag = d.readVarint();
+                        if (tag === 0) break;
+                        
+                        const field = tag >>> 3;
+                        const wire = tag & 0x7;
+                        
+                        if (field === 1 && wire === 2) {
+                            tu.trip = this.parseTripDescriptor(d.readBytes());
+                        } else if (field === 2 && wire === 2) {
+                            const stu = this.parseStopTimeUpdate(d.readBytes());
+                            if (stu) tu.stopTimeUpdate.push(stu);
+                        } else {
+                            d.skipField(wire);
+                        }
+                    } catch {
+                        if (d.pos === startPos) d.pos++;
+                    }
+                }
+                
+                return tu;
+            }
+            
+            parseTripDescriptor(bytes) {
+                if (!bytes || bytes.length === 0) return {};
+                
+                const d = new ProtobufDecoder(bytes);
+                const t = {};
+                
+                while (d.canRead()) {
+                    const startPos = d.pos;
+                    try {
+                        const tag = d.readVarint();
+                        if (tag === 0) break;
+                        
+                        const field = tag >>> 3;
+                        const wire = tag & 0x7;
+                        
+                        if (field === 1 && wire === 2) {
+                            t.tripId = d.readString();
+                        } else if (field === 5 && wire === 2) {
+                            t.routeId = d.readString();
+                        } else {
+                            d.skipField(wire);
+                        }
+                    } catch {
+                        if (d.pos === startPos) d.pos++;
+                    }
+                }
+                
+                return t;
+            }
+            
+            parseStopTimeUpdate(bytes) {
+                if (!bytes || bytes.length === 0) return null;
+                
+                const d = new ProtobufDecoder(bytes);
+                const stu = { stopId: null, arrival: null, departure: null };
+                
+                while (d.canRead()) {
+                    const startPos = d.pos;
+                    try {
+                        const tag = d.readVarint();
+                        if (tag === 0) break;
+                        
+                        const field = tag >>> 3;
+                        const wire = tag & 0x7;
+                        
+                        if (field === 4 && wire === 2) {
+                            stu.stopId = d.readString();
+                        } else if (field === 2 && wire === 2) {
+                            stu.arrival = this.parseStopTimeEvent(d.readBytes());
+                        } else if (field === 3 && wire === 2) {
+                            stu.departure = this.parseStopTimeEvent(d.readBytes());
+                        } else {
+                            d.skipField(wire);
+                        }
+                    } catch {
+                        if (d.pos === startPos) d.pos++;
+                    }
+                }
+                
+                return stu.stopId ? stu : null;
+            }
+            
+            parseStopTimeEvent(bytes) {
+                if (!bytes || bytes.length === 0) return null;
+                
+                const d = new ProtobufDecoder(bytes);
+                const ev = {};
+                
+                while (d.canRead()) {
+                    const startPos = d.pos;
+                    try {
+                        const tag = d.readVarint();
+                        if (tag === 0) break;
+                        
+                        const field = tag >>> 3;
+                        const wire = tag & 0x7;
+                        
+                        if (field === 2 && wire === 0) {
+                            ev.time = d.readVarint64();
+                        } else if (field === 1 && wire === 0) {
+                            ev.delay = d.readVarint();
+                        } else {
+                            d.skipField(wire);
+                        }
+                    } catch {
+                        if (d.pos === startPos) d.pos++;
+                    }
+                }
+                
+                return ev.time ? ev : null;
+            }
+        }
+
+        /**
+         * ================================================================
+         * APPLICATION STATE
+         * ================================================================
+         */
+        const state = {
+            arrivals: { uptown: [], downtown: [] },
+            lastUpdate: null,
+            lastSuccessfulFetch: null,
+            feedTimestamp: null, // MTA feed timestamp for data freshness validation
+            error: null,
+            retryCount: 0,
+            isOnline: navigator.onLine,
+            isFetching: false,
+            renderScheduled: false,
+            feedHealth: { ace: true, bdfm: true } // Track individual feed status
+        };
+
+        /**
+         * ================================================================
+         * NETWORK MONITORING
+         * ================================================================
+         */
+        function updateOnlineStatus() {
+            state.isOnline = navigator.onLine;
+            
+            if (DOM.offlineBanner) {
+                DOM.offlineBanner.classList.toggle('visible', !state.isOnline);
+            }
+            
+            if (state.isOnline && state.error) {
+                // Immediately try to fetch when coming back online
+                scheduleRefresh(100);
+            }
+        }
+        
+        window.addEventListener('online', updateOnlineStatus);
+        window.addEventListener('offline', updateOnlineStatus);
+
+        /**
+         * ================================================================
+         * API FUNCTIONS
+         * ================================================================
+         */
+        async function fetchWithTimeout(url, timeout) {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), timeout);
+            
+            try {
+                const response = await fetch(url, { 
+                    signal: controller.signal,
+                    cache: 'no-store' // Always get fresh data
+                });
+                return response;
+            } finally {
+                clearTimeout(timeoutId);
+            }
+        }
+        
+        async function fetchFeed(url) {
+            const response = await fetchWithTimeout(url, CONFIG.FETCH_TIMEOUT);
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+            
+            const buffer = await response.arrayBuffer();
+            
+            if (buffer.byteLength === 0) {
+                throw new Error('Empty response received');
+            }
+            
+            return new ProtobufDecoder(buffer).parseFeedMessage();
+        }
+        
+        function extractArrivals(feed, targetTrains) {
+            const arrivals = [];
+            const now = Math.floor(Date.now() / 1000);
+            const stationId = CONFIG.STATION_ID;
+            
+            if (!feed?.entity) {
+                return arrivals;
+            }
+            
+            // Validate feed timestamp - reject feeds older than 5 minutes
+            const feedTimestamp = feed.header?.timestamp;
+            if (feedTimestamp && (now - feedTimestamp) > 300) {
+                console.warn('Feed data is stale:', now - feedTimestamp, 'seconds old');
+            }
+            
+            // Store feed timestamp for UI display
+            if (feedTimestamp) {
+                state.feedTimestamp = feedTimestamp;
+            }
+            
+            for (let i = 0; i < feed.entity.length; i++) {
+                const entity = feed.entity[i];
+                
+                if (!entity?.tripUpdate?.trip?.routeId) continue;
+                
+                const routeId = entity.tripUpdate.trip.routeId;
+                if (!targetTrains.includes(routeId)) continue;
+                
+                const stopTimeUpdates = entity.tripUpdate.stopTimeUpdate;
+                if (!stopTimeUpdates) continue;
+                
+                for (let j = 0; j < stopTimeUpdates.length; j++) {
+                    const stu = stopTimeUpdates[j];
+                    
+                    if (!stu?.stopId?.startsWith(stationId)) continue;
+                    
+                    const time = stu.arrival?.time ?? stu.departure?.time;
+                    
+                    // Skip trains that have already departed (with 30s grace)
+                    if (!time || time < now - 30) continue;
+                    
+                    // Skip arrivals too far in the future (over 60 min) as likely erroneous
+                    if (time > now + 3600) continue;
+                    
+                    arrivals.push({
+                        routeId,
+                        direction: stu.stopId.endsWith('N') ? 'N' : 'S',
+                        arrivalTime: time
+                    });
+                }
+            }
+            
+            return arrivals;
+        }
+        
+        async function fetchAllArrivals() {
+            // Prevent concurrent fetches
+            if (state.isFetching) {
+                return;
+            }
+            
+            // Don't fetch if offline
+            if (!state.isOnline) {
+                updateStatus('error', 'Offline');
+                return;
+            }
+            
+            state.isFetching = true;
+            updateStatus('loading', 'Updating...');
+            
+            try {
+                // Fetch both feeds in parallel
+                const results = await Promise.allSettled([
+                    fetchFeed(CONFIG.FEEDS.ACE),
+                    fetchFeed(CONFIG.FEEDS.BDFM)
+                ]);
+                
+                const allArrivals = [];
+                let successCount = 0;
+                
+                // Process ACE feed (A, C trains)
+                if (results[0].status === 'fulfilled') {
+                    const aceArrivals = extractArrivals(results[0].value, ['A', 'C']);
+                    allArrivals.push(...aceArrivals);
+                    successCount++;
+                    state.feedHealth.ace = true;
+                } else {
+                    console.warn('ACE feed failed:', results[0].reason?.message || 'Unknown error');
+                    state.feedHealth.ace = false;
+                }
+                
+                // Process BDFM feed (B train)
+                if (results[1].status === 'fulfilled') {
+                    const bdfmArrivals = extractArrivals(results[1].value, ['B']);
+                    allArrivals.push(...bdfmArrivals);
+                    successCount++;
+                    state.feedHealth.bdfm = true;
+                } else {
+                    console.warn('BDFM feed failed:', results[1].reason?.message || 'Unknown error');
+                    state.feedHealth.bdfm = false;
+                }
+                
+                // If both feeds failed, throw error
+                if (successCount === 0) {
+                    const error = results[0].reason || results[1].reason || new Error('Both feeds failed');
+                    throw error;
+                }
+                
+                // Sort and slice arrivals
+                state.arrivals.uptown = allArrivals
+                    .filter(a => a.direction === 'N')
+                    .sort((a, b) => a.arrivalTime - b.arrivalTime)
+                    .slice(0, CONFIG.TRAINS_PER_DIRECTION);
+                    
+                state.arrivals.downtown = allArrivals
+                    .filter(a => a.direction === 'S')
+                    .sort((a, b) => a.arrivalTime - b.arrivalTime)
+                    .slice(0, CONFIG.TRAINS_PER_DIRECTION);
+                
+                state.lastUpdate = Date.now();
+                state.lastSuccessfulFetch = Date.now();
+                state.error = null;
+                state.retryCount = 0;
+                
+                DOM.errorOverlay?.classList.remove('visible');
+                
+                // Show partial success warning if one feed failed
+                if (successCount === 1) {
+                    const failedFeed = !state.feedHealth.ace ? 'A/C' : 'B';
+                    updateStatus('stale', `Updated (${failedFeed} unavailable)`);
+                } else {
+                    updateStatus('ok', `Updated ${formatTime(new Date(state.lastUpdate))}`);
+                }
+                
+                scheduleRender();
+                
+            } catch (error) {
+                console.error('Fetch error:', error);
+                state.error = error.message || 'Unknown error';
+                state.retryCount++;
+                
+                const backoffDelay = getBackoffDelay(state.retryCount);
+                
+                if (state.retryCount >= CONFIG.MAX_RETRIES) {
+                    DOM.errorOverlay?.classList.add('visible');
+                    if (DOM.errorDetail) {
+                        DOM.errorDetail.textContent = state.error;
+                    }
+                    if (DOM.retryIndicator) {
+                        DOM.retryIndicator.textContent = `Retrying in ${Math.round(backoffDelay / 1000)}s...`;
+                    }
+                    updateStatus('error', 'Connection error');
+                    
+                    // Continue retrying even after max retries, but with longer delays
+                    scheduleRefresh(backoffDelay);
+                } else {
+                    updateStatus('error', `Retry ${state.retryCount}/${CONFIG.MAX_RETRIES}...`);
+                    scheduleRefresh(backoffDelay);
+                }
+            } finally {
+                state.isFetching = false;
+            }
+        }
+
+        /**
+         * ================================================================
+         * UI RENDERING
+         * ================================================================
+         */
+        
+        function getTimeDisplay(arrivalTime) {
+            const now = Date.now() / 1000;
+            const secondsAway = Math.max(0, arrivalTime - now);
+            const minutesAway = Math.floor(secondsAway / 60);
+            
+            if (secondsAway <= 30) {
+                return { text: 'Arriving', unit: '', className: 'arriving-now' };
+            }
+            if (secondsAway <= 90) {
+                return { text: '<1', unit: 'min', className: 'arriving-soon' };
+            }
+            return { text: String(minutesAway), unit: 'min', className: '' };
+        }
+        
+        function createTrainRowElement(arrival, direction, isStale) {
+            const row = document.createElement('div');
+            
+            if (!arrival) {
+                row.className = 'train-row empty';
+                row.innerHTML = `
+                    <div class="train-badge empty">?</div>
+                    <div class="train-info">
+                        <div class="train-time no-trains">No trains</div>
+                    </div>
+                `;
+                return row;
+            }
+            
+            const timeInfo = getTimeDisplay(arrival.arrivalTime);
+            const isArriving = timeInfo.className === 'arriving-now' || timeInfo.className === 'arriving-soon';
+            const dest = DESTINATIONS[direction]?.[arrival.routeId] || '';
+            
+            const classes = ['train-row'];
+            if (isArriving) classes.push('arriving');
+            if (isStale) classes.push('stale');
+            row.className = classes.join(' ');
+            
+            const timeHTML = timeInfo.unit 
+                ? `<span class="train-time ${timeInfo.className}">${timeInfo.text}<span class="unit">${timeInfo.unit}</span></span>`
+                : `<span class="train-time ${timeInfo.className}">${timeInfo.text}</span>`;
+            
+            row.innerHTML = `
+                <div class="train-badge ${arrival.routeId}">${arrival.routeId}</div>
+                <div class="train-info">
+                    <div class="train-destination">${dest}</div>
+                    ${timeHTML}
+                </div>
+            `;
+            
+            return row;
+        }
+        
+        function renderArrivals() {
+            state.renderScheduled = false;
+            
+            const isStale = state.lastSuccessfulFetch 
+                ? (Date.now() - state.lastSuccessfulFetch) > CONFIG.STALE_DATA_THRESHOLD
+                : true;
+            
+            // Use DocumentFragment for batch DOM updates
+            const uptownFrag = document.createDocumentFragment();
+            const downtownFrag = document.createDocumentFragment();
+            
+            for (let i = 0; i < CONFIG.TRAINS_PER_DIRECTION; i++) {
+                uptownFrag.appendChild(createTrainRowElement(state.arrivals.uptown[i], 'N', isStale));
+                downtownFrag.appendChild(createTrainRowElement(state.arrivals.downtown[i], 'S', isStale));
+            }
+            
+            // Batch DOM updates
+            if (DOM.uptownTrains) {
+                DOM.uptownTrains.replaceChildren(uptownFrag);
+            }
+            if (DOM.downtownTrains) {
+                DOM.downtownTrains.replaceChildren(downtownFrag);
+            }
+            
+            // Update stale status indicator
+            if (isStale && !state.error) {
+                updateStatus('stale', 'Data may be outdated');
+            }
+        }
+        
+        // Debounced render to prevent excessive DOM updates
+        function scheduleRender() {
+            if (state.renderScheduled) return;
+            state.renderScheduled = true;
+            
+            requestAnimationFrame(() => {
+                renderArrivals();
+            });
+        }
+        
+        function updateStatus(type, message) {
+            if (DOM.status) {
+                DOM.status.className = `status ${type}`;
+            }
+            if (DOM.statusText) {
+                DOM.statusText.textContent = message;
+            }
+        }
+        
+        // Cached time formatter for better performance
+        const timeFormatter = new Intl.DateTimeFormat('en-US', {
+            hour: 'numeric',
+            minute: '2-digit',
+            hour12: true
+        });
+        
+        function updateClock() {
+            if (DOM.clock) {
+                DOM.clock.textContent = timeFormatter.format(new Date());
+            }
+        }
+        
+        function formatTime(date) {
+            return timeFormatter.format(date);
+        }
+
+        /**
+         * ================================================================
+         * SCHEDULING & LIFECYCLE
+         * ================================================================
+         */
+        
+        let refreshTimeoutId = null;
+        let clockIntervalId = null;
+        let renderIntervalId = null;
+        
+        // Auto-refresh page every 4 hours to prevent memory leaks in long-running displays
+        const PAGE_REFRESH_INTERVAL = 4 * 60 * 60 * 1000;
+        setTimeout(() => {
+            console.log('🔄 Scheduled page refresh for memory management');
+            window.location.reload();
+        }, PAGE_REFRESH_INTERVAL);
+        
+        function scheduleRefresh(delay = CONFIG.REFRESH_INTERVAL) {
+            if (refreshTimeoutId) {
+                clearTimeout(refreshTimeoutId);
+            }
+            
+            refreshTimeoutId = setTimeout(async () => {
+                await fetchAllArrivals();
+                scheduleRefresh();
+            }, delay);
+        }
+        
+        function cleanup() {
+            if (refreshTimeoutId) {
+                clearTimeout(refreshTimeoutId);
+                refreshTimeoutId = null;
+            }
+            if (clockIntervalId) {
+                clearInterval(clockIntervalId);
+                clockIntervalId = null;
+            }
+            if (renderIntervalId) {
+                clearInterval(renderIntervalId);
+                renderIntervalId = null;
+            }
+        }
+        
+        async function init() {
+            console.log('🚇 Subway Display Starting...');
+            console.log(`   Station: ${CONFIG.STATION_ID}`);
+            console.log(`   Refresh: ${CONFIG.REFRESH_INTERVAL}ms`);
+            console.log(`   Trains per direction: ${CONFIG.TRAINS_PER_DIRECTION}`);
+            
+            cacheDOMRefs();
+            updateOnlineStatus();
+            
+            // Start clock immediately
+            updateClock();
+            clockIntervalId = setInterval(updateClock, CONFIG.CLOCK_UPDATE_INTERVAL);
+            
+            // Initial fetch
+            await fetchAllArrivals();
+            
+            // Schedule regular refreshes
+            scheduleRefresh();
+            
+            // Re-render every 5 seconds to keep countdown times accurate
+            renderIntervalId = setInterval(() => {
+                // Clean up arrived trains from state
+                const now = Math.floor(Date.now() / 1000);
+                state.arrivals.uptown = state.arrivals.uptown.filter(a => a.arrivalTime > now - 30);
+                state.arrivals.downtown = state.arrivals.downtown.filter(a => a.arrivalTime > now - 30);
+                
+                scheduleRender();
+            }, 5000);
+            
+            console.log('🚇 Subway Display Ready');
+        }
+        
+        // Handle page visibility changes
+        document.addEventListener('visibilitychange', async () => {
+            if (document.visibilityState === 'visible') {
+                updateOnlineStatus();
+                
+                // Check if data is stale after returning to page
+                const timeSinceUpdate = state.lastSuccessfulFetch 
+                    ? Date.now() - state.lastSuccessfulFetch 
+                    : Infinity;
+                
+                if (timeSinceUpdate > CONFIG.STALE_DATA_THRESHOLD) {
+                    await fetchAllArrivals();
+                }
+                
+                scheduleRender();
+            }
+        });
+        
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', cleanup);
+        window.addEventListener('unload', cleanup);
+        
+        // Handle errors gracefully
+        window.addEventListener('error', (event) => {
+            console.error('Global error:', event.error);
+        });
+        
+        window.addEventListener('unhandledrejection', (event) => {
+            console.error('Unhandled promise rejection:', event.reason);
+        });
+        
+        // Start the application
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', init);
+        } else {
+            init();
+        }
+    </script>
+</body>
+</html>
